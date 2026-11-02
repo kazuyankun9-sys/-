@@ -1,0 +1,96 @@
+# サイトカルテAI（試作版）
+
+見込み客のホームページのURLを入れるだけで、次の3つを作るWebサービスです。
+
+1. **診断スコア**：スマホ対応、表示速度、検索対策、信頼感、問い合わせ導線、更新の新しさの18項目を100点満点で採点
+2. **社長向けレポート**：専門用語を使わずに「何を損しているか」を説明。印刷やPDF保存をして、そのまま提案資料にできる
+3. **営業メモ**（社内用）：切り出しトーク、ヒアリング質問、提案の切り口、反論への切り返し、次の一手
+
+事業計画は [PLAN.md](./PLAN.md) にあります。
+
+---
+
+## 使い方（自分のパソコンで動かす）
+
+必要なもの：Node.js 20以上
+
+```bash
+npm install
+cp .env.example .env.local   # 必要に応じてAPIキーを書き込む
+npm run dev                  # → http://localhost:3000 を開く
+```
+
+APIキーが**無くても動きます**。その場合は、AIを使わない「簡易レポート」（テンプレート文章）になります。
+
+### 設定（`.env.local`）
+
+| 名前 | 必須 | 内容 |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | 任意 | Claude APIのキー。[Claude Console](https://console.anthropic.com/) で発行する。設定するとAIがレポートを書く |
+| `CLAUDE_MODEL` | 任意 | 既定は `claude-opus-5-5`（品質重視）。費用を抑えたいときは `claude-haiku-5-5` |
+| `PAGESPEED_API_KEY` | 推奨 | Google PageSpeed Insights のキー（無料）。無いと無料枠がすぐ尽き、速度は「簡易計測」になる |
+| `DAILY_AI_LIMIT` | 任意 | AIレポートの1日の上限回数（既定30）。API料金の使いすぎを防ぐ |
+
+### 費用の目安
+
+| 項目 | 費用 |
+|---|---|
+| サーバー（Vercelの無料プラン） | 0円 |
+| PageSpeed Insights API | 0円 |
+| Claude API（`claude-opus-5-5`） | 1回あたり約10〜15円（入力 約4千トークン、出力 約3千トークンで試算） |
+| Claude API（`claude-haiku-5-5`） | 1回あたり1円未満 |
+
+`DAILY_AI_LIMIT=30` にしておけば、Opusを使っても1日最大で約450円です。月5,000円以内に収めたい場合は、上限を10回前後にするか、Haikuを使ってください。Claude Consoleで、月の利用上限額も必ず設定してください。
+
+---
+
+## 公開する（Vercel）
+
+1. [Vercel](https://vercel.com/) にGitHubアカウントでログインする
+2. 「Add New → Project」から、このリポジトリを選ぶ
+3. 「Environment Variables」に、上の設定値を入れる
+4. 「Deploy」を押す
+
+※ レート制限はサーバーのメモリ上で数えているので、アクセスが増えて台数が増えると正確ではなくなります。有料化の前に、Upstash Redisなどの共有ストアに置き換えてください。
+
+---
+
+## 開発者向け
+
+```bash
+npm test        # テスト（診断ロジック、安全対策、Claude APIとの通信）
+npm run lint    # 型チェック
+npm run build   # 本番ビルド
+```
+
+### 構成
+
+```
+src/
+  app/
+    page.tsx              画面（入力 → 進捗 → 結果タブ）
+    api/audit/route.ts    サイトを取得してルールで診断する（AIは使わない）
+    api/report/route.ts   診断結果からレポートと営業メモを作る（Claude）
+  lib/
+    audit.ts              18項目の判定ロジックと採点
+    report.ts             Claude APIの呼び出し ＋ AIなしのテンプレート版
+    safeFetch.ts          安全なサイト取得（SSRF対策、Shift_JIS対応、上限つき）
+    robots.ts             robots.txt の確認
+    pagespeed.ts          Google PageSpeed Insights
+    rateLimit.ts          利用回数の制限
+  components/             スコア表示、レポート、営業メモ、チェック一覧
+tests/                    Vitest
+```
+
+### 設計で決めたこと
+
+- **スコアはルールで決め、AIは文章だけを書く**：AIの思い込みで点数が変わらないようにするため。
+- **AIが使えなくても必ず結果を出す**：APIキーの未設定、エラー、上限超過のときは、テンプレート版のレポートに自動で切り替える。
+- **他社サイトへの配慮**：トップページを1回読むだけ。robots.txtで禁止されていれば診断しない。社内ネットワークのアドレスには接続しない。
+- **サイトの本文は「データ」として扱う**：AIへの指示文とは分けて渡し、本文に紛れ込んだ指示には従わせない。
+
+### 既知の制限
+
+- JavaScriptで後から表示される内容（一部のWixやSPAなど）は読み取れないことがある
+- 下層ページ（会社概要ページの中身など）は見ていない
+- 診断履歴はブラウザ（その端末）にだけ保存される
