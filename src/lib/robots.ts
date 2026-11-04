@@ -58,13 +58,22 @@ function matches(pattern: string, path: string): boolean {
   return regex.test(path);
 }
 
-export async function checkRobots(url: URL): Promise<boolean> {
+/**
+ * robots.txt を1回だけ読み、同じサイト内のパスを何度でも確認できる関数を返す。
+ * 取得できない場合は「許可」とみなす（一般的な扱い）。
+ */
+export async function loadRobots(url: URL): Promise<(target: URL) => boolean> {
+  let txt = "";
   try {
     const robotsUrl = new URL("/robots.txt", url);
     const res = await safeFetch(robotsUrl, { timeoutMs: 5000, maxBytes: 256 * 1024, accept: "text/plain,*/*" });
-    if (res.status !== 200) return true;
-    return isAllowedByRobots(res.body.toString("utf8"), url.pathname + url.search);
+    if (res.status === 200) txt = res.body.toString("utf8");
   } catch {
-    return true;
+    // 取得できなければ許可とみなす
   }
+  return (target: URL) => (txt ? isAllowedByRobots(txt, target.pathname + target.search) : true);
+}
+
+export async function checkRobots(url: URL): Promise<boolean> {
+  return (await loadRobots(url))(url);
 }

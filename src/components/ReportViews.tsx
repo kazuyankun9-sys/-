@@ -191,8 +191,8 @@ export function CheckListView({ audit }: { audit: AuditResult }) {
           </div>
         );
       })}
-      <p className="form-note">
-        ※ この診断は、トップページを自動で読み取った結果です。JavaScriptで後から表示される内容や、下層ページの内容は反映されない場合があります。
+      <p className="form-note no-print">
+        ※ この診断は、トップページと会社概要・お問い合わせのページを自動で読み取った結果です。JavaScriptで後から表示される内容や、そのほかの下層ページの内容は反映されない場合があります。
       </p>
     </div>
   );

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BrandSettings, EMPTY_BRAND, loadBrand, PrintFooter, PrintHeader, saveBrand, type Brand } from "@/components/BrandSettings";
 import { ScoreRing, scoreColor } from "@/components/ScoreRing";
 import { CheckListView, OwnerReportView, ReportSkeleton, SalesMemoView, salesMemoToText } from "@/components/ReportViews";
 import type { AuditResult, ReportResult } from "@/lib/types";
@@ -27,7 +28,7 @@ const PRODUCTS = [
   "OA機器・IT環境の導入",
 ];
 
-const STEPS = ["サイトを読み込み中", "18項目をチェック中", "スマホでの表示速度を計測中"];
+const STEPS = ["サイトを読み込み中", "会社概要・お問い合わせページを確認中", "18項目をチェック中", "スマホでの表示速度を計測中"];
 const HISTORY_KEY = "sitekarte:history";
 
 function loadHistory(): HistoryItem[] {
@@ -37,6 +38,17 @@ function loadHistory(): HistoryItem[] {
   } catch {
     return [];
   }
+}
+
+/** サイトのタイトルから、宛名に使えそうな会社名を取り出す（見つからなければ空） */
+function guessCompanyName(title: string): string {
+  const parts = title.split(/\s*[|｜]\s*|\s+[-–—]\s+|[：:]/).map((p) => p.trim()).filter(Boolean);
+  const re = /株式会社|有限会社|合同会社|合資会社|医療法人|社会福祉法人|一般社団法人|税理士法人|弁護士法人|医院|歯科|クリニック|事務所|工務店|製作所|工業|建設/;
+  const hit = parts.find((p) => re.test(p) && p.length <= 30);
+  if (!hit) return "";
+  // 「〇〇なら△△工務店」のような形は、最後の名前の部分だけにする
+  const m = hit.match(/(?:なら|の|は)([^なのは]{2,25})$/);
+  return (m && re.test(m[1]) ? m[1] : hit).trim();
 }
 
 function saveHistory(items: HistoryItem[]) {
@@ -60,15 +72,25 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("owner");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [toast, setToast] = useState("");
+  const [brand, setBrand] = useState<Brand>(EMPTY_BRAND);
+  const [recipient, setRecipient] = useState("");
   const resultRef = useRef<HTMLDivElement>(null);
   const runId = useRef(0);
 
-  useEffect(() => setHistory(loadHistory()), []);
+  useEffect(() => {
+    setHistory(loadHistory());
+    setBrand(loadBrand());
+  }, []);
+
+  const onBrandChange = (b: Brand) => {
+    setBrand(b);
+    if (!saveBrand(b)) setToast("この端末には保存できませんでした（容量やプライベートモードの制限）");
+  };
 
   useEffect(() => {
     if (phase !== "auditing") return;
     setStep(0);
-    const timers = [setTimeout(() => setStep(1), 1800), setTimeout(() => setStep(2), 3500)];
+    const timers = [setTimeout(() => setStep(1), 1500), setTimeout(() => setStep(2), 3500), setTimeout(() => setStep(3), 5000)];
     return () => timers.forEach(clearTimeout);
   }, [phase]);
 
@@ -110,6 +132,7 @@ export default function Home() {
       }
 
       setAudit(result);
+      setRecipient(guessCompanyName(result.facts.title));
       setPhase("done");
       const item: HistoryItem = {
         url: targetUrl,
@@ -164,6 +187,16 @@ export default function Home() {
 
   const printOwner = () => {
     setTab("owner");
+    // 保存されるPDFのファイル名は、ページのタイトルになる
+    const prevTitle = document.title;
+    const name = (recipient.trim() || audit?.facts.title || "").replace(/[\\/:*?"<>|]/g, "").slice(0, 30);
+    const d = new Date();
+    document.title = `ホームページ診断レポート${name ? `_${name}` : ""}_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+    const restore = () => {
+      document.title = prevTitle;
+      window.removeEventListener("afterprint", restore);
+    };
+    window.addEventListener("afterprint", restore);
     setTimeout(() => window.print(), 50);
   };
 
@@ -251,7 +284,7 @@ export default function Home() {
             </div>
           </div>
           <p className="form-note">
-            トップページだけを1回読み取ります。サイトが自動ツールのアクセスを禁止している場合（robots.txt）は診断しません。
+            トップページと、会社概要・お問い合わせのページ（最大2ページ）を1回ずつ読み取ります。サイトが自動ツールのアクセスを禁止している場合（robots.txt）は診断しません。
           </p>
           {error && phase !== "done" && (
             <div className="error-box" role="alert">
@@ -276,17 +309,21 @@ export default function Home() {
 
         {phase === "done" && audit && (
           <div ref={resultRef} style={{ scrollMarginTop: 12 }}>
-            <div className="print-only print-header">
-              <h1>ホームページ診断レポート</h1>
-              <div>
-                {audit.finalUrl} ／ 診断日 {new Date(audit.fetchedAt).toLocaleDateString("ja-JP")}
-              </div>
-            </div>
+            <PrintHeader audit={audit} brand={brand} recipient={recipient} />
             <div className="card summary-card">
               <ScoreRing score={audit.totalScore} grade={audit.grade} />
               <div className="site-meta">
                 <h2>{audit.facts.title || "（タイトルなし）"}</h2>
                 <div className="site-url">{audit.finalUrl}</div>
+                <div className="site-tags no-print">
+                  <span className="tag tag-neutral">
+                    業種：{report?.industryLabel ?? audit.industry?.label ?? "不明"}
+                    {(report?.industryLabel ?? audit.industry?.label) === audit.industry?.label && audit.industry?.id !== "other" ? "（自動判定）" : ""}
+                  </span>
+                  <span className="tag tag-neutral">
+                    確認したページ：{(audit.pagesChecked ?? []).map((p) => (p.kind === "top" ? "トップ" : p.kind === "company" ? "会社概要" : "お問い合わせ")).join("・") || "トップ"}
+                  </span>
+                </div>
                 <div className="cat-bars">
                   {audit.categories.map((c) => (
                     <div key={c.id}>
@@ -317,6 +354,8 @@ export default function Home() {
               </button>
             </div>
 
+            <BrandSettings brand={brand} onChange={onBrandChange} recipient={recipient} onRecipientChange={setRecipient} />
+
             {error && (
               <div className="error-box" role="alert" style={{ marginBottom: 14 }}>
                 {error}
@@ -340,6 +379,7 @@ export default function Home() {
             <div className="tab-panel checks-panel" role="tabpanel" id="panel-checks" hidden={tab !== "checks"}>
               <CheckListView audit={audit} />
             </div>
+            <PrintFooter brand={brand} />
           </div>
         )}
 
@@ -391,7 +431,7 @@ export default function Home() {
 
       <footer className="site-footer">
         <div className="container">
-          <p>※ 診断はトップページを自動で読み取った結果で、正確さを保証するものではありません。提案の前に、実際のサイトもご確認ください。</p>
+          <p>※ 診断はトップページなどを自動で読み取った結果で、正確さを保証するものではありません。提案の前に、実際のサイトもご確認ください。</p>
           <p>※ 入力されたURLと診断結果は、レポート作成のためにAIへ送信されます。</p>
         </div>
       </footer>

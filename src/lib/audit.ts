@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
-import { CATEGORY_META, type AuditResult, type CategoryId, type Check, type PageSpeedError, type PageSpeedResult, type SiteFacts } from "./types";
+import { detectIndustry } from "./industry";
+import { CATEGORY_META, type AuditResult, type CategoryId, type Check, type CheckedPage, type PageSpeedError, type PageSpeedResult, type SiteFacts } from "./types";
 
 /**
  * 取得したHTMLをルールで診断する（AIは使わない）。
@@ -14,7 +15,15 @@ export interface AnalyzeInput {
   responseMs: number;
   htmlBytes: number;
   pagespeed: PageSpeedResult | PageSpeedError;
+  /** 会社概要・問い合わせなどの下層ページ（取得できたものだけ） */
+  subpages?: SubpageInput[];
   now?: Date;
+}
+
+export interface SubpageInput {
+  kind: "company" | "contact";
+  url: string;
+  html: string;
 }
 
 const SNS_PATTERNS: [string, RegExp][] = [
@@ -27,8 +36,18 @@ const SNS_PATTERNS: [string, RegExp][] = [
   ["note", /note\.com/i],
 ];
 
-const CONTACT_RE = /お問い?合わ?せ|お問合せ|問合せ|contact|inquiry|toiawase|ご相談|お見積|見積り?依頼|フォーム/i;
-const CTA_RE = /お問い?合わ?せ|お問合せ|資料請求|無料相談|ご相談|見積|予約|申し?込|LINE|電話する|今すぐ|無料体験|無料診断/i;
+const CONTACT_RE = /お問い?合わ?せ|お問合せ|問合せ|contact|inquiry|toiawase|otoiawase|ご相談|お見積|見積り?依頼|フォーム|(?:^|\/)form(?:\/|\.|$)|mailform/i;
+const CTA_RE = /お問い?合わ?せ|お問合せ|資料請求|相談|見積|予約|申し?込|LINE|電話する|今すぐ|無料体験|無料診断|見学会|査定/i;
+/** 会社概要ページに載っているべき基本情報 */
+const COMPANY_INFO_RES: [string, RegExp][] = [
+  ["代表者", /代表者|代表取締役|代表社員|院長|所長|代表税理士|代表弁護士|オーナー/],
+  ["設立・創業", /設立|創業|創立|開業|開院/],
+  ["所在地", /所在地|本社|住所|〒\s?\d{3}/],
+  ["事業内容", /事業内容|業務内容|営業品目|診療内容|診療科目|取扱業務|主な業務/],
+  ["資本金・従業員数", /資本金|従業員|社員数|スタッフ数/],
+  ["許認可・資格", /許可|登録番号|免許|認定|資格|加盟|所属/],
+];
+const FORM_SERVICE_RE = /docs\.google\.com\/forms|forms\.gle|form-mailer|formrun|form\.run|tayori|hsforms|hubspot|formzu|form\.kintoneapp|questant|typeform/i;
 const COMPANY_RE = /会社概要|会社案内|企業情報|企業概要|会社情報|運営会社|事業者情報|店舗情報|医院案内|事務所案内|アクセス|about|company|corporate|profile/i;
 const PRIVACY_RE = /プライバシー|個人情報|privacy/i;
 const GENERIC_TITLE_RE = /^(home|top|index|トップ|トップページ|ホーム|無題|untitled|新しいページ)$/i;
@@ -68,11 +87,22 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
   ).slice(0, 25);
 
   const rawHtml = input.html;
+  // 画像の中にだけ書かれた文字（電話番号・住所など）。altに入っていれば読み取れる
+  const altText = clean($("img").map((_, el) => $(el).attr("alt") ?? "").get().join(" "));
+  // JavaScriptでタップ発信にしている作り（data-action="call" など）
+  const jsCall = $('[data-action="call" i], [data-tel], [onclick*="tel:" i]').length > 0;
   $("script, style, noscript, svg, template, iframe").remove();
   const bodyText = clean($("body").text() || $.root().text());
 
   const phoneNumbers = extractPhones(bodyText);
+  const imagePhones = extractPhones(altText).filter((p) => !phoneNumbers.includes(p));
   const telLinks = links.filter((l) => /^tel:/i.test(l.href));
+
+  // ---------- 下層ページ ----------
+  const subs = (input.subpages ?? []).map((p) => parseSubpage(p));
+  const companySub = subs.find((p) => p.kind === "company");
+  const contactSub = subs.find((p) => p.kind === "contact");
+  const pagesChecked: CheckedPage[] = [{ kind: "top", url: input.finalUrl }, ...subs.map((p) => ({ kind: p.kind, url: p.url }))];
   const latestDate = extractLatestDate(bodyText, $, now);
   const copyrightYear = extractCopyrightYear(bodyText + " " + rawHtml.slice(-20000));
   const snsFound = SNS_PATTERNS.filter(([, re]) => links.some((l) => re.test(l.href))).map(([name]) => name);
@@ -83,17 +113,19 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
     h1,
     headings,
     navLinks,
-    phoneNumbers: phoneNumbers.slice(0, 3),
+    phoneNumbers: [...phoneNumbers, ...imagePhones].slice(0, 3),
     latestDate: latestDate ? toYmd(latestDate) : null,
     copyrightYear,
     snsFound,
     textExcerpt: bodyText.slice(0, 2500),
+    subpageExcerpt: (companySub ?? contactSub)?.text.slice(0, 1200) ?? "",
   };
 
   const add = (c: Check) => checks.push(c);
 
   // ---------- スマホ対応・表示速度（25点） ----------
-  const viewport = $('meta[name="viewport" i]').attr("content") ?? "";
+  // viewportが複数ある場合はブラウザと同じく最後のものが効くので、それを見る
+  const viewport = $('meta[name="viewport" i]').map((_, el) => $(el).attr("content") ?? "").get().at(-1) ?? "";
   if (/width\s*=\s*device-width/i.test(viewport)) {
     add(ck("viewport", "mobile", "スマホ表示への対応", "pass", 8, 8,
       "スマホの画面幅に合わせて表示する設定があります。",
@@ -237,14 +269,37 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
     isHttps ? "このままで問題ありません。" : "SSL証明書を導入します。今は無料で導入できる場合も多いです。"));
 
   const hasCompany = links.some((l) => COMPANY_RE.test(l.text) || COMPANY_RE.test(l.href));
-  add(ck("company", "trust", "会社・店舗情報のページ", hasCompany ? "pass" : "fail", hasCompany ? 4 : 0, 4,
-    hasCompany ? "会社概要やアクセスなどのページへのリンクがあります。" : "会社概要・店舗情報へのリンクが見つかりませんでした。",
-    hasCompany ? "どんな会社かを確認でき、安心感につながります。" : "初めての人は「どんな会社か」を必ず確認します。見つからないと不安になり、問い合わせをやめてしまいます。",
-    hasCompany ? "代表者の写真や想いを載せると、さらに信頼感が増します。" : "会社概要（所在地・代表者・沿革など）のページを作り、全ページからリンクします。"));
+  const topCompanyInfo = companyInfoItems(bodyText);
+  if (companySub) {
+    const items = companySub.companyInfo;
+    const enough = items.length >= 3;
+    add(ck("company", "trust", "会社・店舗情報のページ", enough ? "pass" : "warn", enough ? 4 : 2, 4,
+      enough
+        ? `会社概要のページを確認しました（${items.join("・")}が載っています）。`
+        : `会社概要のページはありますが、${COMPANY_INFO_RES.map(([n]) => n).filter((n) => !items.includes(n)).slice(0, 3).join("・")}などの基本情報が見当たりませんでした。`,
+      enough ? "どんな会社かを確認でき、安心感につながります。" : "初めての人は「どんな会社か」を必ず確認します。情報が少ないと「大丈夫かな」と不安になり、問い合わせをためらいます。",
+      enough ? "代表者の写真や想いを載せると、さらに信頼感が増します。" : "代表者名・設立年・所在地・事業内容・許認可などを表にまとめ、代表者の写真とあいさつも載せます。"));
+  } else if (hasCompany || topCompanyInfo.length >= 3) {
+    add(ck("company", "trust", "会社・店舗情報のページ", "pass", 4, 4,
+      hasCompany ? "会社概要やアクセスなどのページへのリンクがあります。" : `トップページ内に会社情報が載っています（${topCompanyInfo.join("・")}）。`,
+      "どんな会社かを確認でき、安心感につながります。",
+      "代表者の写真や想いを載せると、さらに信頼感が増します。"));
+  } else {
+    add(ck("company", "trust", "会社・店舗情報のページ", "fail", 0, 4,
+      "会社概要・店舗情報へのリンクが見つかりませんでした。",
+      "初めての人は「どんな会社か」を必ず確認します。見つからないと不安になり、問い合わせをやめてしまいます。",
+      "会社概要（所在地・代表者・沿革など）のページを作り、全ページからリンクします。"));
+  }
 
-  const hasPrivacy = links.some((l) => PRIVACY_RE.test(l.text) || PRIVACY_RE.test(l.href));
+  const hasPrivacyTop = links.some((l) => PRIVACY_RE.test(l.text) || PRIVACY_RE.test(l.href));
+  const privacySub = subs.find((p) => p.hasPrivacy);
+  const hasPrivacy = hasPrivacyTop || !!privacySub;
   add(ck("privacy", "trust", "個人情報の取り扱い", hasPrivacy ? "pass" : "warn", hasPrivacy ? 3 : 0, 3,
-    hasPrivacy ? "プライバシーポリシーへのリンクがあります。" : "プライバシーポリシー（個人情報の取り扱い）へのリンクが見つかりませんでした。",
+    hasPrivacyTop
+      ? "プライバシーポリシーへのリンクがあります。"
+      : privacySub
+        ? `${PAGE_LABEL[privacySub.kind]}のページに、プライバシーポリシーへのリンクがあります。`
+        : `プライバシーポリシー（個人情報の取り扱い）へのリンクが見つかりませんでした${subs.length ? `（${subs.map((p) => PAGE_LABEL[p.kind]).join("・")}のページも確認）` : ""}。`,
     hasPrivacy ? "問い合わせ時の安心材料になっています。" : "フォームで名前や電話番号を入力してもらう以上、取り扱いの明記は信頼の基本です。",
     hasPrivacy ? "このままで問題ありません。" : "プライバシーポリシーのページを用意し、フォームの近くにもリンクします。"));
 
@@ -274,11 +329,16 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
   }
 
   // ---------- 問い合わせへの導線（25点） ----------
-  if (telLinks.length > 0) {
+  if (telLinks.length > 0 || (jsCall && phoneNumbers.length > 0)) {
     add(ck("tel", "conversion", "スマホから電話できるか", "pass", 7, 7,
-      "電話番号をタップするとそのまま電話できる設定があります。",
+      telLinks.length > 0 ? "電話番号をタップするとそのまま電話できる設定があります。" : "電話番号をタップして電話できる仕組み（プログラムによる設定）があります。",
       "スマホから見た人が、迷わずすぐに電話できます。",
       "このままで問題ありません。"));
+  } else if (phoneNumbers.length === 0 && imagePhones.length > 0) {
+    add(ck("tel", "conversion", "スマホから電話できるか", "warn", 2, 7,
+      `電話番号（${imagePhones[0]}）が画像の中にだけ書かれています。`,
+      "画像の番号はタップしても電話がかからず、コピーもできません。スマホで見た人は番号を打ち直す必要があり、その手間で電話をやめてしまう人がいます。",
+      "電話番号を文字で書き、タップで発信できるリンクにします（数分でできる修正です）。"));
   } else if (phoneNumbers.length > 0) {
     add(ck("tel", "conversion", "スマホから電話できるか", "warn", 4, 7,
       `電話番号（${phoneNumbers[0]}）は書かれていますが、タップしても電話がかかりません。`,
@@ -293,10 +353,31 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
 
   const hasForm = $("form").filter((_, el) => $(el).find("textarea, input[type=email]").length > 0).length > 0;
   const hasContactLink = links.some((l) => CONTACT_RE.test(l.text) || CONTACT_RE.test(l.href));
-  add(ck("contact", "conversion", "問い合わせフォーム", hasForm || hasContactLink ? "pass" : "fail", hasForm || hasContactLink ? 8 : 0, 8,
-    hasForm ? "ページ内に問い合わせフォームがあります。" : hasContactLink ? "問い合わせページへのリンクがあります。" : "問い合わせフォーム・ページへのリンクが見つかりませんでした。",
-    hasForm || hasContactLink ? "電話が苦手な人や営業時間外でも、問い合わせを受け取れます。" : "夜間や休日にサイトを見た人、電話が苦手な人からの問い合わせをすべて逃しています。",
-    hasForm || hasContactLink ? "入力項目を減らすと、問い合わせ数がさらに増えることが多いです。" : "入力項目の少ない問い合わせフォームを用意し、各ページから案内します。"));
+  if (hasForm) {
+    add(ck("contact", "conversion", "問い合わせフォーム", "pass", 8, 8,
+      "ページ内に問い合わせフォームがあります。",
+      "電話が苦手な人や営業時間外でも、問い合わせを受け取れます。",
+      "入力項目を減らすと、問い合わせ数がさらに増えることが多いです。"));
+  } else if (contactSub && !contactSub.hasForm) {
+    add(ck("contact", "conversion", "問い合わせフォーム", "warn", 5, 8,
+      "問い合わせページはありますが、入力フォームは見当たりませんでした（電話・メールアドレスの案内だけの可能性があります）。",
+      "メールソフトを開いて文章を書くのは手間がかかるため、気軽な相談を逃している可能性があります。",
+      "名前・連絡先・ご相談内容だけを入力すれば送れる、短いフォームを用意します。"));
+  } else if (hasContactLink || contactSub) {
+    add(ck("contact", "conversion", "問い合わせフォーム", "pass", 8, 8,
+      contactSub?.formFields
+        ? `問い合わせフォームがあります（入力欄は${contactSub.formFields}個）。`
+        : "問い合わせページへのリンクがあります。",
+      "電話が苦手な人や営業時間外でも、問い合わせを受け取れます。",
+      contactSub?.formFields && contactSub.formFields > 8
+        ? "入力欄が多めです。必須項目を減らすと、途中でやめる人が減ります。"
+        : "入力項目を減らすと、問い合わせ数がさらに増えることが多いです。"));
+  } else {
+    add(ck("contact", "conversion", "問い合わせフォーム", "fail", 0, 8,
+      "問い合わせフォーム・ページへのリンクが見つかりませんでした。",
+      "夜間や休日にサイトを見た人、電話が苦手な人からの問い合わせをすべて逃しています。",
+      "入力項目の少ない問い合わせフォームを用意し、各ページから案内します。"));
+  }
 
   const ctaCount = links.filter((l) => CTA_RE.test(l.text)).length + $("button").filter((_, el) => CTA_RE.test(clean($(el).text()))).length;
   add(ck("cta", "conversion", "行動を促すボタン", ctaCount >= 3 ? "pass" : ctaCount >= 1 ? "warn" : "fail", ctaCount >= 3 ? 5 : ctaCount >= 1 ? 3 : 0, 5,
@@ -304,20 +385,42 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
     ctaCount >= 3 ? "読み進めた人が、自然に問い合わせへ進めます。" : "興味を持った人が「次に何をすればいいか」迷い、そのまま帰ってしまいます。",
     ctaCount >= 3 ? "ボタンの文言を「無料で相談する」など具体的にすると、さらに効果的です。" : "ページの上・中・下に「無料相談はこちら」などのボタンを置きます。"));
 
-  const hasAddress = /〒\s?\d{3}[-ー－‐]?\d{4}/.test(bodyText) || /(東京都|北海道|(?:京都|大阪)府|[^\s]{2,3}県)[^\s]{1,8}(市|区|郡|町|村)/.test(bodyText);
-  const hasHours = /営業時間|受付時間|診療時間|定休日|営業日|休業日/.test(bodyText);
+  const topText = bodyText + " " + altText;
+  const hasAddress = hasAddressText(topText);
+  const hasHours = hasHoursText(topText);
+  const subAddress = subs.find((p) => hasAddressText(p.text));
+  const subHours = subs.find((p) => hasHoursText(p.text));
   const infoCount = (hasAddress ? 1 : 0) + (hasHours ? 1 : 0);
-  add(ck("access", "conversion", "所在地・営業時間の表示", infoCount === 2 ? "pass" : infoCount === 1 ? "warn" : "fail", infoCount === 2 ? 5 : infoCount === 1 ? 3 : 0, 5,
-    infoCount === 2 ? "所在地と営業時間（受付時間）が載っています。" : infoCount === 1 ? `${hasAddress ? "所在地" : "営業時間"}は載っていますが、${hasAddress ? "営業時間・受付時間" : "所在地"}が見当たりません。` : "トップページに所在地・営業時間が見当たりません。",
-    infoCount === 2 ? "「いつ・どこに連絡すればいいか」がすぐ分かります。" : "「今電話していいのか」「近いのか」が分からず、問い合わせをためらう原因になります。",
-    infoCount === 2 ? "このままで問題ありません。" : "ページ下部に、所在地・営業時間・定休日をまとめて載せます。"));
+  if (infoCount === 2) {
+    add(ck("access", "conversion", "所在地・営業時間の表示", "pass", 5, 5,
+      "所在地と営業時間（受付時間）が載っています。",
+      "「いつ・どこに連絡すればいいか」がすぐ分かります。",
+      "このままで問題ありません。"));
+  } else if ((hasAddress || subAddress) && (hasHours || subHours)) {
+    const where = [!hasAddress && subAddress && `所在地は${PAGE_LABEL[subAddress.kind]}ページ`, !hasHours && subHours && `営業時間は${PAGE_LABEL[subHours.kind]}ページ`].filter(Boolean).join("、");
+    add(ck("access", "conversion", "所在地・営業時間の表示", "warn", 4, 5,
+      `トップページには一部しか無く、${where}に載っています。`,
+      "情報はありますが、探す手間がかかります。スマホで「今電話していいか」をすぐ確認したい人には不便です。",
+      "ページ下部（フッター）に、所在地・営業時間・定休日をまとめて載せ、全ページに表示します。"));
+  } else if (infoCount === 1 || subAddress || subHours) {
+    const okAddress = hasAddress || !!subAddress;
+    add(ck("access", "conversion", "所在地・営業時間の表示", "warn", 3, 5,
+      `${okAddress ? "所在地" : "営業時間"}は載っていますが、${okAddress ? "営業時間・受付時間" : "所在地"}が見当たりません。`,
+      "「今電話していいのか」「近いのか」が分からず、問い合わせをためらう原因になります。",
+      "ページ下部に、所在地・営業時間・定休日をまとめて載せます。"));
+  } else {
+    add(ck("access", "conversion", "所在地・営業時間の表示", "fail", 0, 5,
+      "所在地・営業時間が見当たりません（画像の中だけに書かれている可能性もあります）。",
+      "「今電話していいのか」「近いのか」が分からず、問い合わせをためらう原因になります。",
+      "ページ下部に、所在地・営業時間・定休日を文字で載せます。"));
+  }
 
   // ---------- 情報の新しさ・発信（10点） ----------
   if (!latestDate) {
     add(ck("updated", "freshness", "最近の更新", "warn", 2, 6,
       "日付の入ったお知らせ・ブログが見当たりませんでした。",
       "「今も営業しているか」「活発な会社か」が伝わりにくい状態です。",
-      "月1回でも、お知らせや施工事例・お客様の声を日付付きで更新します。"));
+      "月1回でも、お知らせ・実績や事例・お客様の声を日付付きで更新します。"));
   } else {
     const days = Math.floor((now.getTime() - latestDate.getTime()) / 86400000);
     const [status, score] = days <= 90 ? (["pass", 6] as const) : days <= 365 ? (["warn", 3] as const) : (["fail", 0] as const);
@@ -353,7 +456,104 @@ export function analyzeHtml(input: AnalyzeInput): AuditResult {
     checks,
     pagespeed: input.pagespeed,
     facts,
+    pagesChecked,
+    industry: detectIndustry({ title, description, h1, headings, text: bodyText + " " + (companySub?.text ?? "") }),
   };
+}
+
+const PAGE_LABEL = { company: "会社概要", contact: "お問い合わせ" } as const;
+
+interface ParsedSubpage {
+  kind: "company" | "contact";
+  url: string;
+  text: string;
+  hasPrivacy: boolean;
+  hasForm: boolean;
+  formFields: number;
+  companyInfo: string[];
+}
+
+function parseSubpage(p: SubpageInput): ParsedSubpage {
+  const $ = cheerio.load(p.html);
+  const hasPrivacy = $("a").toArray().some((el) => PRIVACY_RE.test(clean($(el).text())) || PRIVACY_RE.test($(el).attr("href") ?? ""));
+  const forms = $("form").filter((_, el) => $(el).find("textarea, input[type=email], input[type=text], input[type=tel]").length > 0);
+  const formFields = forms.find("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio]), textarea, select").length;
+  // 外部のフォームサービスを埋め込んでいる場合（Googleフォームなど）もフォームありとみなす
+  const embedded = $("iframe").toArray().some((el) => FORM_SERVICE_RE.test($(el).attr("src") ?? "")) || FORM_SERVICE_RE.test(p.html);
+  $("script, style, noscript, svg, template, iframe").remove();
+  const text = clean($("body").text() || $.root().text());
+  return {
+    kind: p.kind,
+    url: p.url,
+    text,
+    hasPrivacy,
+    hasForm: forms.length > 0 || embedded,
+    formFields,
+    companyInfo: companyInfoItems(text),
+  };
+}
+
+function companyInfoItems(text: string): string[] {
+  return COMPANY_INFO_RES.filter(([, re]) => re.test(text)).map(([name]) => name);
+}
+
+export function hasAddressText(text: string): boolean {
+  return (
+    /〒\s?\d{3}[-ー－‐−]?\d{4}/.test(text) ||
+    /(東京都|北海道|(?:京都|大阪)府|[^\s]{2,3}県)\s?[^\s]{1,8}(市|区|郡|町|村)/.test(text) ||
+    // 政令指定都市の区（例：京都市 中京区）
+    /[一-龥]{1,4}市\s?[一-龥]{1,3}区/.test(text) ||
+    // 「◯◯市△△1-2-3」のような番地つきの住所
+    /[一-龥ぁ-んァ-ヶ]{1,6}[市区町村]\s?[一-龥ぁ-んァ-ヶ]{1,10}\s?[0-9０-９]{1,4}\s?(?:丁目|番地?|[-ー－‐−])/.test(text)
+  );
+}
+
+export function hasHoursText(text: string): boolean {
+  return /営業時間|受付時間|診療時間|定休日|営業日|休業日|休診日|休診|診療日|OPEN\s|open\s?\d|\d{1,2}[:：]\d{2}\s?[〜~～\-－ー]\s?\d{1,2}[:：]\d{2}/i.test(text);
+}
+
+/**
+ * トップページのリンクから、会社概要とお問い合わせのページを1つずつ探す。
+ * 同じサイト内のリンクだけを対象にする（外部サイトには行かない）。
+ */
+export function findSubpageLinks(html: string, baseUrl: string): { kind: "company" | "contact"; url: string }[] {
+  const $ = cheerio.load(html);
+  const base = new URL(baseUrl);
+  const sameSite = (u: URL) => u.hostname.replace(/^www\./, "") === base.hostname.replace(/^www\./, "");
+  type Cand = { url: string; score: number };
+  const company: Cand[] = [];
+  const contact: Cand[] = [];
+  $("a[href]").each((_, el) => {
+    const href = ($(el).attr("href") ?? "").trim();
+    if (!href || /^(?:#|mailto:|tel:|javascript:)/i.test(href)) return;
+    let u: URL;
+    try {
+      u = new URL(href, base);
+    } catch {
+      return;
+    }
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || !sameSite(u)) return;
+    if (/\.(?:pdf|jpe?g|png|gif|zip|docx?|xlsx?)$/i.test(u.pathname)) return;
+    u.hash = "";
+    if (u.toString() === base.toString()) return;
+    const text = clean($(el).text()) || clean($(el).find("img").attr("alt") ?? "");
+    const path = decodeURIComponent(u.pathname).toLowerCase();
+    if (/会社概要|会社案内|企業情報|企業概要|会社情報|事業者情報|医院案内|医院紹介|クリニック紹介|事務所案内|事務所概要|事務所紹介|店舗情報/.test(text) || /company|about|gaiyo|gaiyou|profile|corporate|outline|overview|office|access/.test(path)) {
+      const score = (/会社概要|企業情報|会社案内|事務所概要|医院案内/.test(text) ? 3 : 0) + (/company|gaiyo|outline|profile/.test(path) ? 2 : 0) + (/access|アクセス/.test(path + text) ? -1 : 0);
+      company.push({ url: u.toString(), score });
+    }
+    if (CONTACT_RE.test(text) || /contact|inquiry|toiawase|otoiawase|(?:^|\/)form(?:\/|\.|$)|mailform/.test(path)) {
+      const score = (/お問い?合わ?せ|お問合せ/.test(text) ? 3 : 0) + (/contact|inquiry|toiawase/.test(path) ? 2 : 0);
+      contact.push({ url: u.toString(), score });
+    }
+  });
+  const pick = (list: Cand[]) => list.sort((a, b) => b.score - a.score)[0]?.url;
+  const result: { kind: "company" | "contact"; url: string }[] = [];
+  const c = pick(company);
+  const q = pick(contact.filter((x) => x.url !== c));
+  if (c) result.push({ kind: "company", url: c });
+  if (q) result.push({ kind: "contact", url: q });
+  return result;
 }
 
 export function gradeOf(score: number): AuditResult["grade"] {

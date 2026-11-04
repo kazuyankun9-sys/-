@@ -1,3 +1,5 @@
+import type { IndustryId } from "./industry";
+
 export type CategoryId = "mobile" | "seo" | "trust" | "conversion" | "freshness";
 
 export type CheckStatus = "pass" | "warn" | "fail";
@@ -50,6 +52,15 @@ export interface SiteFacts {
   copyrightYear: number | null;
   snsFound: string[];
   textExcerpt: string;
+  /** 会社概要などの下層ページから抜き出した本文（無ければ空） */
+  subpageExcerpt: string;
+}
+
+export type PageKind = "top" | "company" | "contact";
+
+export interface CheckedPage {
+  kind: PageKind;
+  url: string;
 }
 
 export interface AuditResult {
@@ -64,6 +75,10 @@ export interface AuditResult {
   checks: Check[];
   pagespeed: PageSpeedResult | PageSpeedError;
   facts: SiteFacts;
+  /** 実際に読み込んだページ（トップ＋下層） */
+  pagesChecked: CheckedPage[];
+  /** サイトの文字から推定した業種 */
+  industry: { id: IndustryId; label: string };
 }
 
 export interface SalesContext {
@@ -73,6 +88,8 @@ export interface SalesContext {
 
 export interface ReportResult {
   source: "ai" | "template";
+  /** 営業メモを作るときに使った業種 */
+  industryLabel?: string;
   /** template になった理由など */
   note?: string;
   ownerReport: {

@@ -46,7 +46,18 @@ const AuditSchema = z.object({
     copyrightYear: z.number().nullable(),
     snsFound: z.array(z.string().max(30)).max(10),
     textExcerpt: z.string().max(3000),
+    subpageExcerpt: z.string().max(1500).default(""),
   }),
+  pagesChecked: z
+    .array(z.object({ kind: z.enum(["top", "company", "contact"]), url: z.string().max(2048) }))
+    .max(5)
+    .default([]),
+  industry: z
+    .object({
+      id: z.enum(["construction", "dental", "clinic", "professional", "manufacturing", "restaurant", "beauty", "realestate", "other"]),
+      label: z.string().max(60),
+    })
+    .default({ id: "other", label: "その他・不明" }),
 });
 
 const Body = z.object({

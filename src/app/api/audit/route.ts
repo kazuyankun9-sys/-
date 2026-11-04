@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { analyzeHtml } from "@/lib/audit";
+import { analyzeHtml, findSubpageLinks, type SubpageInput } from "@/lib/audit";
 import { runPageSpeed } from "@/lib/pagespeed";
 import { clientIp, hitRateLimit } from "@/lib/rateLimit";
-import { checkRobots } from "@/lib/robots";
+import { loadRobots } from "@/lib/robots";
 import { decodeHtml, FetchError, normalizeUrl, safeFetch } from "@/lib/safeFetch";
 
 export const runtime = "nodejs";
@@ -26,7 +26,8 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: msg }, { status: 400 });
   }
 
-  if (!(await checkRobots(url))) {
+  const robotsAllows = await loadRobots(url);
+  if (!robotsAllows(url)) {
     return NextResponse.json(
       { error: "このサイトは、自動ツールによるアクセスを許可していない（robots.txt）ため、診断できません。" },
       { status: 403 },
@@ -48,6 +49,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "このURLはホームページ（HTML）ではないようです。" }, { status: 422 });
     }
     const html = decodeHtml(page.body, contentType);
+    // 会社概要・お問い合わせのページを最大2ページだけ読む（速度計測を待つ間に進める）
+    const subpages = await fetchSubpages(html, page.finalUrl, robotsAllows);
     const pagespeed = await pagespeedPromise;
     const result = analyzeHtml({
       html,
@@ -56,6 +59,7 @@ export async function POST(req: Request) {
       responseMs: page.elapsedMs,
       htmlBytes: page.body.length,
       pagespeed,
+      subpages,
     });
     return NextResponse.json(result);
   } catch (e) {
@@ -63,4 +67,28 @@ export async function POST(req: Request) {
     if (!(e instanceof FetchError)) console.error("[audit]", e);
     return NextResponse.json({ error: msg }, { status: 422 });
   }
+}
+
+async function fetchSubpages(html: string, baseUrl: string, robotsAllows: (u: URL) => boolean): Promise<SubpageInput[]> {
+  const result: SubpageInput[] = [];
+  let links: ReturnType<typeof findSubpageLinks>;
+  try {
+    links = findSubpageLinks(html, baseUrl);
+  } catch {
+    return result;
+  }
+  // 相手のサーバーに負担をかけないよう、同時ではなく1ページずつ読む
+  for (const link of links.slice(0, 2)) {
+    try {
+      const u = normalizeUrl(link.url);
+      if (!robotsAllows(u)) continue;
+      const res = await safeFetch(u, { timeoutMs: 6000, maxBytes: 1024 * 1024 });
+      const ct = String(res.headers["content-type"] ?? "");
+      if (res.status >= 400 || (ct && !/html|xml/i.test(ct))) continue;
+      result.push({ kind: link.kind, url: res.finalUrl, html: decodeHtml(res.body, ct) });
+    } catch {
+      // 下層ページが読めなくても、トップページだけで診断を続ける
+    }
+  }
+  return result;
 }

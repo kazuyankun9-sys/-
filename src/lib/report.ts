@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
+import { resolveIndustry } from "./industry";
 import type { AuditResult, Check, ReportResult, SalesContext } from "./types";
 
 /**
@@ -55,6 +56,8 @@ const SYSTEM_PROMPT = `あなたは、中小企業のホームページ改善を
    - 不安をあおりすぎず、良い点も正直に認めてください。誇張や断定（「必ず売上が上がる」など）はしないでください。
 2. salesMemo: 営業担当が商談前に読む内部用のメモ
    - 相手を責めずに、相手が自分で課題に気づけるような質問を中心にしてください。
+   - 「業種の特徴」に書かれた、その業種のお客様の選び方・増やしたい成果を踏まえ、その業種の経営者が「うちのことを分かっている」と感じる具体的な言葉で書いてください。どの業種にも言える一般論は避けてください。
+   - 診断で見つかった課題と、業種ならではの事情（例：歯科なら自費診療やWeb予約、製造業なら図面添付の見積もりや採用）を結びつけてください。
    - 営業担当が扱う商材が分かっている場合は、それに自然につながる提案にしてください。押し売りにならないようにしてください。
 
 守ること:
@@ -89,7 +92,7 @@ export async function generateReport(audit: AuditResult, context: SalesContext):
     if (response.stop_reason === "max_tokens" || !response.parsed_output) {
       return templateReport(audit, context, "AIの出力が不完全だったため、簡易レポートを表示しています。");
     }
-    return { source: "ai", ...response.parsed_output };
+    return { source: "ai", industryLabel: resolveIndustry(context.industry, audit.industry).label, ...response.parsed_output };
   } catch (error) {
     let note = "AIレポートの作成に失敗したため、簡易レポートを表示しています。";
     if (error instanceof Anthropic.AuthenticationError) {
@@ -120,8 +123,12 @@ function buildUserPrompt(audit: AuditResult, context: SalesContext): string {
     ? `スマホ速度スコア ${audit.pagespeed.performance}/100`
     : `速度の詳細計測なし（${audit.pagespeed.reason}）`;
 
+  const ind = resolveIndustry(context.industry, audit.industry);
+  const pages = (audit.pagesChecked ?? []).map((p) => (p.kind === "top" ? "トップ" : p.kind === "company" ? "会社概要" : "お問い合わせ")).join("・") || "トップ";
+
   return `## 診断結果
 URL: ${audit.finalUrl}
+確認したページ: ${pages}
 総合スコア: ${audit.totalScore}/100点（ランク${audit.grade}）
 ${ps}
 
@@ -132,8 +139,12 @@ ${categories}
 ${checks}
 
 ## 営業側の情報
-- 相手の業種: ${context.industry?.trim() || "不明（サイトの内容から推測してください）"}
+- 相手の業種: ${ind.label}${ind.auto ? (ind.profile.id === "other" ? "（自動判定できず。サイトの内容から推測してください）" : "（サイトの内容から自動判定）") : "（営業担当が入力）"}
 - 提案したい商材: ${context.product?.trim() || "ホームページの改善・リニューアル全般"}
+
+## 業種の特徴（参考）
+- お客様の選び方: ${ind.profile.journey}
+- サイトで増やしたい成果: ${ind.profile.goal}
 
 ## サイトから抜き出した情報
 <site_content>
@@ -144,7 +155,9 @@ ${checks}
 メニュー: ${f.navLinks.join(" / ") || "(なし)"}
 SNS: ${f.snsFound.join("、") || "(なし)"}
 本文の抜粋:
-${f.textExcerpt}
+${f.textExcerpt}${f.subpageExcerpt ? `
+下層ページ（会社概要など）の抜粋:
+${f.subpageExcerpt}` : ""}
 </site_content>`;
 }
 
@@ -189,6 +202,11 @@ const QUESTION_BY_CHECK: Record<string, { question: string; intent: string }> = 
   company: { question: "初めてのお客様から「どんな会社か」を聞かれることはありますか？", intent: "会社情報を充実させる価値を確かめる" },
 };
 
+const OTHER_OBJECTION = {
+  objection: "以前お願いした制作会社がいる",
+  response: "もちろん今の制作会社さんにご依頼いただいても大丈夫です。このレポートを依頼内容の整理にお使いください。セカンドオピニオンが必要な時はお声がけください。",
+};
+
 export function templateReport(audit: AuditResult, context: SalesContext, note?: string): ReportResult {
   const issues = [...audit.checks]
     .filter((c) => c.status !== "pass")
@@ -210,9 +228,14 @@ export function templateReport(audit: AuditResult, context: SalesContext, note?:
     (issues.length ? `特に「${issues[0].label}」を直すと、効果が出やすいと考えられます。` : "");
 
   const product = context.product?.trim() || "ホームページの改善";
+  const ind = resolveIndustry(context.industry, audit.industry);
+  const profile = ind.profile;
+  const isOther = profile.id === "other";
+  const issueQuestions = issues.map((c) => QUESTION_BY_CHECK[c.id]).filter(Boolean);
 
   return {
     source: "template",
+    industryLabel: ind.label,
     note,
     ownerReport: {
       headline,
@@ -229,23 +252,26 @@ export function templateReport(audit: AuditResult, context: SalesContext, note?:
     },
     salesMemo: {
       opening: issues.length
-        ? `御社のホームページを拝見しました。${passes[0] ? `${passes[0].label}はしっかりされていますね。` : ""}一方で、「${issues[0].label}」の点で、お問い合わせを逃しているかもしれない箇所がありましたので、5分ほど共有させてください。`
+        ? `御社のホームページを拝見しました。${passes[0] ? `${passes[0].label}はしっかりされていますね。` : ""}一方で、「${issues[0].label}」の点で、${isOther ? "お問い合わせ" : profile.goal.split("（")[0]}を逃しているかもしれない箇所がありましたので、5分ほど共有させてください。`
         : "御社のホームページを拝見しました。基本がとてもしっかりしていますね。さらに問い合わせを増やすためのアイデアを、5分ほど共有させてください。",
-      hearingQuestions: [
-        ...issues.map((c) => QUESTION_BY_CHECK[c.id]).filter(Boolean),
-        { question: "ホームページで、いちばん増やしたいのは何ですか？（問い合わせ・採用・来店など）", intent: "相手のゴールを確認し、提案の軸を決める" },
-      ].slice(0, 4),
+      hearingQuestions: (isOther
+        ? [
+            ...issueQuestions.slice(0, 3),
+            ...profile.hearingQuestions,
+            { question: "ホームページで、いちばん増やしたいのは何ですか？（問い合わせ・採用・来店など）", intent: "相手のゴールを確認し、提案の軸を決める" },
+          ]
+        : [...profile.hearingQuestions.slice(0, 3), ...issueQuestions.slice(0, 2)]
+      ).slice(0, 5),
       proposalAngles: [
         issues[0] && { title: `${issues[0].label}の改善`, pitch: `${issues[0].fix} ${product}の一環として、まずここから着手するのが効果的です。` },
-        issues[1] && { title: `${issues[1].label}の改善`, pitch: issues[1].fix },
-        { title: "小さく始める", pitch: "すべてを一度に直す必要はありません。効果の大きいところから段階的に進めれば、費用も抑えられます。" },
-      ].filter(Boolean) as { title: string; pitch: string }[],
-      objections: [
-        { objection: "今のホームページで困っていない", response: "ありがとうございます。困っていないからこそ、見えていない取りこぼしがあるかもしれません。診断結果だけでも社内でご確認いただけますか？" },
-        { objection: "予算がない", response: "おっしゃる通りです。今回の診断で「すぐできる」とした項目は小さな修正で済むものです。まずは費用のかからない部分から一緒に整理しましょう。" },
-        { objection: "以前お願いした制作会社がいる", response: "もちろん今の制作会社さんにご依頼いただいても大丈夫です。このレポートを依頼内容の整理にお使いください。セカンドオピニオンが必要な時はお声がけください。" },
-      ],
-      nextAction: "このレポートをPDFでお渡しし、1週間以内に「すぐできる」項目の進め方と概算費用をご提案する日程を決める。",
+        ...(isOther
+          ? [issues[1] && { title: `${issues[1].label}の改善`, pitch: issues[1].fix }, ...profile.proposalAngles]
+          : profile.proposalAngles.slice(0, 2)),
+      ]
+        .filter(Boolean)
+        .slice(0, 3) as { title: string; pitch: string }[],
+      objections: (isOther ? profile.objections : [...profile.objections.slice(0, 2), OTHER_OBJECTION]).slice(0, 3),
+      nextAction: `このレポートをPDFでお渡しし、1週間以内に「すぐできる」項目の進め方と概算費用をご提案する日程を決める。${isOther ? "" : `${profile.label}では「${profile.goal}」を増やすことが目標になるので、現状の件数を聞いておく。`}`,
     },
   };
 }
